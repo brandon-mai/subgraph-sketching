@@ -23,6 +23,8 @@ def get_test_func(model_str):
         return get_preds
 
 
+from src.runners.train import get_loss
+
 @torch.no_grad()
 def test(model, evaluator, train_loader, val_loader, test_loader, args, device, emb=None, eval_metric='hits'):
     print('starting testing')
@@ -47,8 +49,15 @@ def test(model, evaluator, train_loader, val_loader, test_loader, args, device, 
         results = evaluate_auc(val_pred, val_true, test_pred, test_true)
 
     print(f'testing ran in {time.time() - t0}')
+    
+    # Calculate losses
+    loss_func = get_loss(args.loss)
+    train_loss = loss_func(train_pred.to(device), train_true.to(device)).item()
+    val_loss = loss_func(val_pred.to(device), val_true.to(device)).item()
+    test_loss = loss_func(test_pred.to(device), test_true.to(device)).item()
+    losses = {'train': train_loss, 'val': val_loss, 'test': test_loss}
 
-    return results
+    return results, losses
 
 
 @torch.no_grad()

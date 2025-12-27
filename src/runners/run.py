@@ -13,6 +13,7 @@ sys.path.insert(0, '..')
 import numpy as np
 import torch
 from ogb.linkproppred import Evaluator
+import matplotlib.pyplot as plt
 try:
     from huggingface_hub import HfApi
 except ImportError:
@@ -69,6 +70,7 @@ def run(args):
         emb = select_embedding(args, dataset.data.num_nodes, device)
         model, optimizer = select_model(args, dataset, emb, device)
         val_res = test_res = best_epoch = 0
+        epoch_losses = {'train': [], 'val': [], 'epochs': []}
         print(f'running repetition {rep}')
         # if rep == 0:
         #     print_model_params(model)
@@ -76,8 +78,14 @@ def run(args):
             t0 = time.time()
             loss = train_func(model, optimizer, train_loader, args, device)
             if (epoch + 1) % args.eval_steps == 0:
-                results = test(model, evaluator, train_eval_loader, val_loader, test_loader, args, device,
+                results, losses = test(model, evaluator, train_eval_loader, val_loader, test_loader, args, device,
                                eval_metric=eval_metric)
+                
+                # Track losses
+                epoch_losses['train'].append(loss) # Use training loss from train_func (running avg)
+                epoch_losses['val'].append(losses['val'])
+                epoch_losses['epochs'].append(epoch)
+
                 for key, result in results.items():
                     train_res, tmp_val_res, tmp_test_res = result
                     if tmp_val_res > val_res:
@@ -88,51 +96,66 @@ def run(args):
                                f'rep{rep}_Val' + key: 100 * val_res, f'rep{rep}_tmp_val' + key: 100 * tmp_val_res,
                                f'rep{rep}_tmp_test' + key: 100 * tmp_test_res,
                                f'rep{rep}_Test' + key: 100 * test_res, f'rep{rep}_best_epoch': best_epoch,
-                               f'rep{rep}_epoch_time': time.time() - t0, 'epoch_step': epoch}
+                               f'rep{rep}_epoch_time': time.time() - t0, 'epoch_step': epoch,
+                               f'rep{rep}_Val_Loss': losses['val']}
                     if args.wandb:
                         wandb.log(res_dic)
-                    to_print = f'Epoch: {epoch:02d}, Best epoch: {best_epoch}, Loss: {loss:.4f}, Train: {100 * train_res:.2f}%, Valid: ' \
+                    to_print = f'Epoch: {epoch:02d}, Best epoch: {best_epoch}, Loss: {loss:.4f}, Val Loss: {losses["val"]:.4f}, Train: {100 * train_res:.2f}%, Valid: ' \
                                f'{100 * val_res:.2f}%, Test: {100 * test_res:.2f}%, epoch time: {time.time() - t0:.1f}'
                     print(key)
                     print(to_print)
-        if args.reps > 1:
-            results_list.append([test_res, val_res, train_res])
-            print_results_list(results_list)
-    if args.reps > 1:
-        test_acc_mean, val_acc_mean, train_acc_mean = np.mean(results_list, axis=0) * 100
-        test_acc_std = np.sqrt(np.var(results_list, axis=0)[0]) * 100
-        val_acc_std = np.sqrt(np.var(results_list, axis=0)[1]) * 100
-
-        wandb_results = {'test_mean': test_acc_mean, 'val_mean': val_acc_mean, 'train_mean': train_acc_mean,
-                         'test_acc_std': test_acc_std, 'val_acc_std': val_acc_std}
-        print(wandb_results)
-        if args.wandb:
-            wandb.log(wandb_results)
-    if args.wandb:
-        wandb.finish()
-    if args.save_model:
+        
+        # Plotting Learning Curve
+        plt.figure()
+        plt.plot(epoch_losses['epochs'], epoch_losses['train'], label='Train Loss')
+        plt.plot(epoch_losses['epochs'], epoch_losses['val'], label='Val Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title(f'Learning Curve - Rep {rep}')
+        plt.legend()
+        plot_path = f'{ROOT_DIR}/saved_models/{args.dataset_name}_rep{rep}_loss.png'
+        # Ensure dir exists (already checked before saving model but safe to recheck or assume exists if save_model is on, 
+        # but to be sure for plotting regardless of save_model flag:)
         import os
-        path = f'{ROOT_DIR}/saved_models/{args.dataset_name}'
-        if not os.path.exists(os.path.dirname(path)):
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(model.state_dict(), path)
-        print(f"Model saved to {path}")
+        if not os.path.exists(os.path.dirname(plot_path)):
+             os.makedirs(os.path.dirname(plot_path), exist_ok=True)
+        plt.savefig(plot_path)
+        plt.close()
 
-        if args.hf_repo_id:
-            if HfApi is None:
-                print("Warning: HfApi not imported. Install huggingface_hub to push model.")
-            else:
-                try:
-                    api = HfApi(token=args.hf_token)
-                    api.upload_file(
-                        path_or_fileobj=path,
-                        path_in_repo=f"{args.dataset_name}_model.pt",
-                        repo_id=args.hf_repo_id,
-                        repo_type="model"
-                    )
-                    print(f"Model pushed to {args.hf_repo_id}")
-                except Exception as e:
-                     print(f"Failed to push model to Hugging Face: {e}")
+        if args.wandb:
+             wandb.log({f"learning_curve_rep{rep}": wandb.Image(plot_path)})
+
+        if args.save_model:
+            path = f'{ROOT_DIR}/saved_models/{args.dataset_name}'
+            if not os.path.exists(os.path.dirname(path)):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            torch.save(model.state_dict(), path)
+            print(f"Model saved to {path}")
+
+            if args.hf_repo_id:
+                if HfApi is None:
+                    print("Warning: HfApi not imported. Install huggingface_hub to push model.")
+                else:
+                    try:
+                        api = HfApi(token=args.hf_token)
+                        # Upload model
+                        api.upload_file(
+                            path_or_fileobj=path,
+                            path_in_repo=f"{args.dataset_name}_model.pt",
+                            repo_id=args.hf_repo_id,
+                            repo_type="model"
+                        )
+                        print(f"Model pushed to {args.hf_repo_id}")
+                        # Upload plot
+                        api.upload_file(
+                            path_or_fileobj=plot_path,
+                            path_in_repo=f"{args.dataset_name}_rep{rep}_loss.png",
+                            repo_id=args.hf_repo_id,
+                            repo_type="model"
+                        )
+                        print(f"Plot pushed to {args.hf_repo_id}")
+                    except Exception as e:
+                        print(f"Failed to push to Hugging Face: {e}")
 
 
 
