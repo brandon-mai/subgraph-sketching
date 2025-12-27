@@ -65,8 +65,8 @@ def run(args):
         model, optimizer = select_model(args, dataset, emb, device)
         val_res = test_res = best_epoch = 0
         print(f'running repetition {rep}')
-        if rep == 0:
-            print_model_params(model)
+        # if rep == 0:
+        #     print_model_params(model)
         for epoch in range(args.epochs):
             t0 = time.time()
             loss = train_func(model, optimizer, train_loader, args, device)
