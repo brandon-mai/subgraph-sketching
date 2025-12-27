@@ -74,6 +74,28 @@ def run(args):
         val_res = test_res = best_epoch = 0
         epoch_losses = {'train': [], 'val': [], 'epochs': []}
         pull_targets = None
+        
+        # PULL checks and dynamic setup
+        current_k = 0
+        k_growth = 0
+        if args.use_pull:
+            if hasattr(train_loader.dataset, 'labels'):
+                # Check if labels is tensor or list training dataset usually has .labels
+                import torch
+                if torch.is_tensor(train_loader.dataset.labels):
+                    num_pos_edges = (train_loader.dataset.labels == 1).sum().item()
+                else:
+                    # Assuming numpy or list
+                    num_pos_edges = int(sum(np.array(train_loader.dataset.labels) == 1))
+            else:
+                num_pos_edges = args.pull_k # Fallback to arg if logic fails
+            
+            current_k = num_pos_edges
+            k_growth = int(0.05 * num_pos_edges)
+            # Update interval dynamically to target ~10 updates
+            args.pull_interval = max(1, args.epochs // 10)
+            print(f"PULL Enabled: Ep={num_pos_edges}, Initial K={current_k}, Growth={k_growth}, Interval={args.pull_interval}")
+
         print(f'running repetition {rep}')
         # if rep == 0:
         #     print_model_params(model)
@@ -83,15 +105,12 @@ def run(args):
             # PULL updates
             if args.use_pull and (epoch % args.pull_interval == 0):
                 if epoch == 0:
-                    # Initial targets can be just labels or None (standard training start)
-                    # Let's initialize with labels implicitly in train loop if None, 
-                    # but here we might want to run a warm-up. 
-                    # For simplicity, start PULL updates after first interval or immediately?
-                    # Ideally we train a bit then refine.
                     pass 
                 else:
                     # Update targets
-                    pull_targets = update_pull_targets(model, train_loader, device, args.pull_k)
+                    print(f"Updating PULL targets with K={current_k}")
+                    pull_targets = update_pull_targets(model, train_loader, device, current_k)
+                    current_k += k_growth
             
             loss = train_func(model, optimizer, train_loader, args, device, pull_targets=pull_targets)
             if (epoch + 1) % args.eval_steps == 0:
@@ -421,7 +440,7 @@ if __name__ == '__main__':
     # PULL settings
     parser.add_argument('--use_pull', action='store_true', help='whether to use PULL (Positive Unlabeled Learning)')
     parser.add_argument('--pull_k', type=int, default=1000, help='number of pseudo-positives for PULL')
-    parser.add_argument('--pull_interval', type=int, default=1, help='epoch interval for updating PULL targets')
+    parser.add_argument('--pull_interval', type=int, default=10, help='epoch interval for updating PULL targets')
 
     args = parser.parse_args()
     if (args.max_hash_hops == 1) and (not args.use_zero_one):
