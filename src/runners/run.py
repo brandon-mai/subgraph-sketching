@@ -81,7 +81,6 @@ def run(args):
         if args.use_pull:
             if hasattr(train_loader.dataset, 'labels'):
                 # Check if labels is tensor or list training dataset usually has .labels
-                import torch
                 if torch.is_tensor(train_loader.dataset.labels):
                     num_pos_edges = (train_loader.dataset.labels == 1).sum().item()
                 else:
@@ -92,8 +91,6 @@ def run(args):
             
             current_k = num_pos_edges
             k_growth = int(0.05 * num_pos_edges)
-            # Update interval dynamically to target ~10 updates
-            args.pull_interval = max(1, args.epochs // 10)
             print(f"PULL Enabled: Ep={num_pos_edges}, Initial K={current_k}, Growth={k_growth}, Interval={args.pull_interval}")
 
         print(f'running repetition {rep}')
@@ -447,8 +444,11 @@ if __name__ == '__main__':
         print("WARNING: (0,1) feature knock out is not supported for 1 hop. Running with all features")
         args.use_zero_one = True
     if args.use_pull and args.pull_k <= 0:
-         print("WARNING: PULL enabled but pull_k is <= 0. Disabling PULL.")
-         args.use_pull = False
+        print("WARNING: PULL enabled but pull_k is <= 0. Disabling PULL.")
+        args.use_pull = False
+    if args.use_pull and args.epochs / args.pull_interval > 10:
+        print("WARNING: Max 10 updates of PULL targets only. Setting new interval to fit 10 updates.")
+        args.pull_interval = args.epochs // 10
     if args.dataset_name == 'ogbl-ddi':
         args.use_feature = 0  # dataset has no features
         assert args.sign_k > 0, '--sign_k must be set to > 0 i.e. 1,2 or 3 for ogbl-ddi'
