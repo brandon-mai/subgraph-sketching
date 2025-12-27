@@ -4,7 +4,7 @@ hashed based data sketching for graphs. Implemented in pytorch, but based on the
 from time import time
 import logging
 
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import torch
 from torch import float
 import numpy as np
@@ -269,7 +269,7 @@ class ElphHashes(object):
             links = links.unsqueeze(0)
         link_loader = DataLoader(range(links.size(0)), batch_size, shuffle=False, num_workers=0)
         all_features = []
-        for batch in tqdm(link_loader):
+        for batch in tqdm(link_loader, disable=len(link_loader) <= 1):
             intersections = self._get_intersections(links[batch], hash_table)
             cards1, cards2 = cards.to(links.device)[links[batch, 0]], cards.to(links.device)[links[batch, 1]]
             features = torch.zeros((len(batch), self.max_hops * (self.max_hops + 2)), dtype=float, device=links.device)

@@ -3,7 +3,7 @@ A selection of heuristic methods (Personalized PageRank, Adamic Adar and Common 
 """
 
 import numpy as np
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import torch
 from torch_geometric.loader import DataLoader
 

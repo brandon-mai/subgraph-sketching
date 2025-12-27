@@ -16,7 +16,7 @@ from torch_geometric.data import Data, Dataset, InMemoryDataset
 import numpy as np
 from torch_geometric.utils import (negative_sampling, add_self_loops)
 from torch_sparse import coalesce
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import scipy.sparse as ssp
 
 from src.utils import get_src_dst_degree, neighbors, get_pos_neg_edges
