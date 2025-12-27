@@ -18,6 +18,8 @@ try:
     from huggingface_hub import HfApi
 except ImportError:
     HfApi = None
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 
 torch.set_printoptions(precision=4)
@@ -71,12 +73,27 @@ def run(args):
         model, optimizer = select_model(args, dataset, emb, device)
         val_res = test_res = best_epoch = 0
         epoch_losses = {'train': [], 'val': [], 'epochs': []}
+        pull_targets = None
         print(f'running repetition {rep}')
         # if rep == 0:
         #     print_model_params(model)
         for epoch in range(args.epochs):
             t0 = time.time()
-            loss = train_func(model, optimizer, train_loader, args, device)
+            
+            # PULL updates
+            if args.use_pull and (epoch % args.pull_interval == 0):
+                if epoch == 0:
+                    # Initial targets can be just labels or None (standard training start)
+                    # Let's initialize with labels implicitly in train loop if None, 
+                    # but here we might want to run a warm-up. 
+                    # For simplicity, start PULL updates after first interval or immediately?
+                    # Ideally we train a bit then refine.
+                    pass 
+                else:
+                    # Update targets
+                    pull_targets = update_pull_targets(model, train_loader, device, args.pull_k)
+            
+            loss = train_func(model, optimizer, train_loader, args, device, pull_targets=pull_targets)
             if (epoch + 1) % args.eval_steps == 0:
                 results, losses = test(model, evaluator, train_eval_loader, val_loader, test_loader, args, device,
                                eval_metric=eval_metric)
@@ -190,6 +207,98 @@ def select_model(args, dataset, emb, device):
     if args.model == 'DGCNN':
         print(f'SortPooling k is set to {model.k}')
     return model, optimizer
+
+
+@torch.no_grad()
+def update_pull_targets(model, train_loader, device, k):
+    """
+    Construct PULL target matrix.
+    Positives (observed) = 1
+    Top-K confident Negatives = Predicted Probability (Pseudo-Positive)
+    Other Negatives = 0
+    """
+    model.eval()
+    
+    data = train_loader.dataset
+    if hasattr(data, 'links'):
+        links = data.links
+        labels = torch.tensor(data.labels)
+    else:
+        # Fallback for datasets without explicit links attribute, though BUDDY/ELPH use it
+        return None
+
+    dataset_len = len(links)
+    # Create a non-shuffling loader for consistency
+    if hasattr(train_loader, 'batch_size'):
+        bs = train_loader.batch_size
+    else:
+        bs = 1024
+        
+    seq_loader = DataLoader(range(dataset_len), batch_size=bs, shuffle=False, num_workers=0)
+    
+    pull_targets = torch.zeros(dataset_len, dtype=torch.float, device=device)
+    pull_targets[labels == 1] = 1.0 # Keep positives as 1
+    
+    neg_mask = (labels == 0)
+    if neg_mask.sum() == 0:
+        return pull_targets
+
+    preds = []
+    indices_list = []
+    
+    for indices in tqdm(seq_loader, desc="Updating PULL targets", disable=len(seq_loader) <= 1):
+        curr_links = links[indices].to(device)
+        
+        if isinstance(model, ELPH):
+            node_features, hashes, cards = model(data.x.to(device), data.edge_index.to(device))
+            # Just extract what we need
+            batch_node_features = None if node_features is None else node_features[curr_links]
+            batch_emb = None if model.node_embedding is None else model.node_embedding.weight[curr_links].to(device)
+            if hasattr(model, 'elph_hashes') and model.elph_hashes is not None:
+                subgraph_features = model.elph_hashes.get_subgraph_features(curr_links, hashes, cards).to(device)
+            else:
+                 subgraph_features = torch.zeros((len(indices), 0)).to(device)
+            logits = model.predictor(subgraph_features, batch_node_features, batch_emb)
+            
+        elif isinstance(model, BUDDY):
+            # For BUDDY, subgraph features are precomputed in data.subgraph_features
+            # But we need them aligned with indices
+            subgraph_features = data.subgraph_features[indices].to(device)
+            node_features = data.x[curr_links].to(device)
+            degrees = data.degrees[curr_links].to(device)
+            if hasattr(data, 'RA') and data.RA is not None:
+                RA = data.RA[indices].to(device)
+            else:
+                RA = None
+            batch_emb = None 
+            if model.node_embedding is not None:
+                batch_emb = model.node_embedding.weight[curr_links].to(device)
+            
+            logits = model(subgraph_features, node_features, degrees[:, 0], degrees[:, 1], RA, batch_emb)
+        else:
+            # Skip for other models
+            continue
+
+        preds.append(torch.sigmoid(logits).view(-1).detach())
+        indices_list.append(indices)
+        
+    if len(preds) > 0:
+        all_preds = torch.cat(preds).to(device)
+        
+        # Filter for negatives only
+        neg_indices = torch.nonzero(neg_mask.to(device), as_tuple=True)[0]
+        neg_scores = all_preds[neg_indices]
+        
+        # Top K
+        if len(neg_scores) > k:
+            topk_vals, topk_idx = torch.topk(neg_scores, k)
+            global_topk_idx = neg_indices[topk_idx]
+            pull_targets[global_topk_idx] = topk_vals # Soft target
+        else:
+            pull_targets[neg_indices] = neg_scores
+
+    return pull_targets
+
 
 
 if __name__ == '__main__':
@@ -309,10 +418,18 @@ if __name__ == '__main__':
     parser.add_argument('--log_features', action='store_true', help="log feature importance")
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for pushing the model')
     parser.add_argument('--hf_repo_id', type=str, default=None, help='Hugging Face repo ID to push to')
+    # PULL settings
+    parser.add_argument('--use_pull', action='store_true', help='whether to use PULL (Positive Unlabeled Learning)')
+    parser.add_argument('--pull_k', type=int, default=1000, help='number of pseudo-positives for PULL')
+    parser.add_argument('--pull_interval', type=int, default=1, help='epoch interval for updating PULL targets')
 
     args = parser.parse_args()
     if (args.max_hash_hops == 1) and (not args.use_zero_one):
         print("WARNING: (0,1) feature knock out is not supported for 1 hop. Running with all features")
+        args.use_zero_one = True
+    if args.use_pull and args.pull_k <= 0:
+         print("WARNING: PULL enabled but pull_k is <= 0. Disabling PULL.")
+         args.use_pull = False
     if args.dataset_name == 'ogbl-ddi':
         args.use_feature = 0  # dataset has no features
         assert args.sign_k > 0, '--sign_k must be set to > 0 i.e. 1,2 or 3 for ogbl-ddi'

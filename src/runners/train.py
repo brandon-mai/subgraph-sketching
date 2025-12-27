@@ -24,7 +24,7 @@ def get_train_func(args):
     return train_func
 
 
-def train_buddy(model, optimizer, train_loader, args, device, emb=None):
+def train_buddy(model, optimizer, train_loader, args, device, emb=None, pull_targets=None):
     print('starting training')
     t0 = time.time()
     model.train()
@@ -70,7 +70,25 @@ def train_buddy(model, optimizer, train_loader, args, device, emb=None):
         start_time = time.time()
         optimizer.zero_grad()
         logits = model(subgraph_features, node_features, degrees[:, 0], degrees[:, 1], RA, batch_emb)
-        loss = get_loss(args.loss)(logits, labels[indices].squeeze(0).to(device))
+        
+        if pull_targets is not None:
+            # PULL Loss
+            # Map back to global indices to fetch targets
+            # sample_indices maps sampled batch to original dataset
+            global_indices = sample_indices[indices]
+            batch_pull_targets = pull_targets[global_indices].to(device)
+            batch_labels = labels[indices].squeeze(0).to(device)
+            
+            # Loss E: Expected
+            loss_E = BCEWithLogitsLoss()(logits.flatten(), batch_pull_targets)
+            
+            # Loss C: Correction (Standard BCE on raw labels)
+            # Original labels 1/0
+            loss_C = BCEWithLogitsLoss()(logits.flatten(), batch_labels.float())
+            
+            loss = loss_E + loss_C
+        else:
+            loss = get_loss(args.loss)(logits, labels[indices].squeeze(0).to(device))
 
         loss.backward()
         optimizer.step()
@@ -89,7 +107,7 @@ def train_buddy(model, optimizer, train_loader, args, device, emb=None):
     return total_loss / len(train_loader.dataset)
 
 
-def train(model, optimizer, train_loader, args, device, emb=None):
+def train(model, optimizer, train_loader, args, device, emb=None, pull_targets=None):
     """
     Adapted version of the SEAL training function
     :param model:
@@ -157,7 +175,7 @@ def train(model, optimizer, train_loader, args, device, emb=None):
     return total_loss / len(train_loader.dataset)
 
 
-def train_elph(model, optimizer, train_loader, args, device):
+def train_elph(model, optimizer, train_loader, args, device, pull_targets=None):
     """
     train a GNN that calculates hashes using message passing
     @param model:
@@ -207,7 +225,18 @@ def train_elph(model, optimizer, train_loader, args, device):
         start_time = time.time()
         optimizer.zero_grad()
         logits = model.predictor(subgraph_features, batch_node_features, batch_emb)
-        loss = get_loss(args.loss)(logits, labels[indices].squeeze(0).to(device))
+        
+        if pull_targets is not None:
+            # PULL Loss
+            global_indices = sample_indices[indices]
+            batch_pull_targets = pull_targets[global_indices].to(device)
+            batch_labels = labels[indices].squeeze(0).to(device)
+            
+            loss_E = BCEWithLogitsLoss()(logits.flatten(), batch_pull_targets)
+            loss_C = BCEWithLogitsLoss()(logits.flatten(), batch_labels.float())
+            loss = loss_E + loss_C
+        else:
+            loss = get_loss(args.loss)(logits, labels[indices].squeeze(0).to(device))
 
         loss.backward()
         optimizer.step()
