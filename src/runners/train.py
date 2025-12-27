@@ -241,6 +241,30 @@ def auc_loss(logits, y, num_neg=1):
     return torch.square(1 - (pos_out - neg_out)).sum()
 
 
+def hinge_auc_loss(logits, y, num_neg=1):
+    pos_out = logits[y == 1]
+    neg_out = logits[y == 0]
+    if len(neg_out) <= len(pos_out):
+        pos_out = pos_out[:len(neg_out)]
+    else:
+        neg_out = neg_out[:len(pos_out)]
+    pos_out = torch.reshape(pos_out, (-1, 1))
+    neg_out = torch.reshape(neg_out, (-1, num_neg))
+    return (torch.square(torch.clamp(1 - (pos_out - neg_out), min=0))).sum()
+
+
+def log_rank_loss(logits, y, num_neg=1):
+    pos_out = logits[y == 1]
+    neg_out = logits[y == 0]
+    if len(neg_out) <= len(pos_out):
+        pos_out = pos_out[:len(neg_out)]
+    else:
+        neg_out = neg_out[:len(pos_out)]
+    pos_out = torch.reshape(pos_out, (-1, 1))
+    neg_out = torch.reshape(neg_out, (-1, num_neg))
+    return -torch.log(torch.sigmoid(pos_out - neg_out) + 1e-15).mean()
+
+
 def bce_loss(logits, y, num_neg=1):
     return BCEWithLogitsLoss()(logits.view(-1), y.to(torch.float))
 
@@ -250,6 +274,10 @@ def get_loss(loss_str):
         loss = bce_loss
     elif loss_str == 'auc':
         loss = auc_loss
+    elif loss_str == 'hauc':
+        loss = hinge_auc_loss
+    elif loss_str == 'rank':
+        loss = log_rank_loss
     else:
         raise NotImplementedError
     return loss

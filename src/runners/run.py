@@ -234,7 +234,7 @@ if __name__ == '__main__':
                         help="also train free-parameter node embeddings together with GNN")
     parser.add_argument('--propagate_embeddings', action='store_true',
                         help='propagate the node embeddings using the GCN diffusion operator')
-    parser.add_argument('--loss', default='bce', type=str, help='bce or auc')
+    parser.add_argument('--loss', default='bce', type=str, help='bce, auc, hauc, or rank')
     parser.add_argument('--add_normed_features', dest='add_normed_features', type=str2bool,
                         help='Adds a set of features that are normalsied by sqrt(d_i*d_j) to calculate cosine sim')
     parser.add_argument('--use_RA', type=str2bool, default=False, help='whether to add resource allocation features')
