@@ -13,6 +13,11 @@ sys.path.insert(0, '..')
 import numpy as np
 import torch
 from ogb.linkproppred import Evaluator
+try:
+    from huggingface_hub import HfApi
+except ImportError:
+    HfApi = None
+
 
 torch.set_printoptions(precision=4)
 import wandb
@@ -106,8 +111,29 @@ def run(args):
     if args.wandb:
         wandb.finish()
     if args.save_model:
+        import os
         path = f'{ROOT_DIR}/saved_models/{args.dataset_name}'
+        if not os.path.exists(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(model.state_dict(), path)
+        print(f"Model saved to {path}")
+
+        if args.hf_repo_id:
+            if HfApi is None:
+                print("Warning: HfApi not imported. Install huggingface_hub to push model.")
+            else:
+                try:
+                    api = HfApi(token=args.hf_token)
+                    api.upload_file(
+                        path_or_fileobj=path,
+                        path_in_repo=f"{args.dataset_name}_model.pt",
+                        repo_id=args.hf_repo_id,
+                        repo_type="model"
+                    )
+                    print(f"Model pushed to {args.hf_repo_id}")
+                except Exception as e:
+                     print(f"Failed to push model to Hugging Face: {e}")
+
 
 
 def select_model(args, dataset, emb, device):
@@ -258,6 +284,9 @@ if __name__ == '__main__':
     parser.add_argument('--wandb_epoch_list', nargs='+', default=[0, 1, 2, 4, 8, 16],
                         help='list of epochs to log gradient flow')
     parser.add_argument('--log_features', action='store_true', help="log feature importance")
+    parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for pushing the model')
+    parser.add_argument('--hf_repo_id', type=str, default=None, help='Hugging Face repo ID to push to')
+
     args = parser.parse_args()
     if (args.max_hash_hops == 1) and (not args.use_zero_one):
         print("WARNING: (0,1) feature knock out is not supported for 1 hop. Running with all features")
