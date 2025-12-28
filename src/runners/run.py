@@ -20,6 +20,7 @@ except ImportError:
     HfApi = None
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+from torch_geometric.utils import degree
 
 
 torch.set_printoptions(precision=4)
@@ -96,18 +97,34 @@ def run(args):
         print(f'running repetition {rep}')
         # if rep == 0:
         #     print_model_params(model)
+        
+        pull_updates_count = 0
+        last_val_metric = -inf
+        stop_pull_updates = False
+
         for epoch in range(args.epochs):
             t0 = time.time()
             
             # PULL updates
-            if args.use_pull and (epoch % args.pull_interval == 0):
+            if args.use_pull and not stop_pull_updates and (epoch % args.pull_interval == 0):
                 if epoch == 0:
                     pass 
                 else:
-                    # Update targets
-                    print(f"Updating PULL targets with K={current_k}")
-                    pull_targets = update_pull_targets(model, train_loader, device, current_k)
-                    current_k += k_growth
+                    # Check stopping conditions
+                    if pull_updates_count >= 10:
+                        print("PULL: Max updates (10) reached. Stopping PULL updates.")
+                        stop_pull_updates = True
+                    elif val_res < last_val_metric:
+                         # Metric dropped
+                         print(f"PULL: Early stopping triggered. Val metric dropped ({val_res:.4f} < {last_val_metric:.4f}).")
+                         stop_pull_updates = True
+                    else:
+                        # Update targets
+                        print(f"Updating PULL targets with K={current_k}")
+                        pull_targets = update_pull_targets(model, train_loader, device, current_k, m=args.pull_m)
+                        current_k += k_growth
+                        pull_updates_count += 1
+                        last_val_metric = val_res # Update metric reference
             
             loss = train_func(model, optimizer, train_loader, args, device, pull_targets=pull_targets)
             if (epoch + 1) % args.eval_steps == 0:
@@ -226,12 +243,13 @@ def select_model(args, dataset, emb, device):
 
 
 @torch.no_grad()
-def update_pull_targets(model, train_loader, device, k):
+def update_pull_targets(model, train_loader, device, k, m=100):
     """
     Construct PULL target matrix.
     Positives (observed) = 1
-    Top-K confident Negatives = Predicted Probability (Pseudo-Positive)
+    Top-K confident Negatives (from candidate set) = Predicted Probability (Pseudo-Positive)
     Other Negatives = 0
+    candidate set = edges where at least one node is in top M degree nodes
     """
     model.eval()
     
@@ -240,11 +258,9 @@ def update_pull_targets(model, train_loader, device, k):
         links = data.links
         labels = torch.tensor(data.labels)
     else:
-        # Fallback for datasets without explicit links attribute, though BUDDY/ELPH use it
         return None
 
     dataset_len = len(links)
-    # Create a non-shuffling loader for consistency
     if hasattr(train_loader, 'batch_size'):
         bs = train_loader.batch_size
     else:
@@ -253,11 +269,23 @@ def update_pull_targets(model, train_loader, device, k):
     seq_loader = DataLoader(range(dataset_len), batch_size=bs, shuffle=False, num_workers=0)
     
     pull_targets = torch.zeros(dataset_len, dtype=torch.float, device=device)
-    pull_targets[labels == 1] = 1.0 # Keep positives as 1
+    pull_targets[labels == 1] = 1.0 
     
     neg_mask = (labels == 0)
     if neg_mask.sum() == 0:
         return pull_targets
+    
+    # Calculate degrees if not present or just recalculate to be safe on the graph structure
+    if hasattr(data, 'edge_index'):
+        # data.edge_index spans all nodes
+        d = degree(data.edge_index[0], num_nodes=data.num_nodes)
+        _, top_m_nodes = torch.topk(d, m)
+        top_m_nodes = top_m_nodes.to(device)
+    else:
+        # If no global edge index available easily (SEAL sometimes splits it), 
+        # fallback to no filtering or warn?
+        # Assuming typical OGB/Planetoid datasets have edge_index in data object
+        top_m_nodes = None
 
     preds = []
     indices_list = []
@@ -265,9 +293,30 @@ def update_pull_targets(model, train_loader, device, k):
     for indices in tqdm(seq_loader, desc="Updating PULL targets", disable=len(seq_loader) <= 1):
         curr_links = links[indices].to(device)
         
+        # Filter: check if src or dst is in top_m_nodes
+        if top_m_nodes is not None:
+             src, dst = curr_links[:, 0], curr_links[:, 1]
+             # Check mask: (src in top_m) | (dst in top_m)
+             # Efficient check: use strict containment or boolean mask?
+             # For large tensors `isin` can be slow. 
+             # Optimization: create a boolean mask for all nodes
+             node_mask = torch.zeros(data.num_nodes, dtype=torch.bool, device=device)
+             node_mask[top_m_nodes] = True
+             
+             mask_src = node_mask[src]
+             mask_dst = node_mask[dst]
+             candidate_mask = mask_src | mask_dst
+             
+             # If no candidate in this batch, can skip prediction for them?
+             # We only need predictions for CANDIDATES that are also NEGATIVES.
+             # We can zero out others later, but for efficiency we might want to predict only candidates.
+             # But the model processes batches. Masking the creation of features is harder.
+             # Let's predict all then mask.
+        else:
+             candidate_mask = torch.ones(len(indices), dtype=torch.bool, device=device)
+
         if isinstance(model, ELPH):
             node_features, hashes, cards = model(data.x.to(device), data.edge_index.to(device))
-            # Just extract what we need
             batch_node_features = None if node_features is None else node_features[curr_links]
             batch_emb = None if model.node_embedding is None else model.node_embedding.weight[curr_links].to(device)
             if hasattr(model, 'elph_hashes') and model.elph_hashes is not None:
@@ -277,26 +326,26 @@ def update_pull_targets(model, train_loader, device, k):
             logits = model.predictor(subgraph_features, batch_node_features, batch_emb)
             
         elif isinstance(model, BUDDY):
-            # For BUDDY, subgraph features are precomputed in data.subgraph_features
-            # But we need them aligned with indices
             subgraph_features = data.subgraph_features[indices].to(device)
             node_features = data.x[curr_links].to(device)
             degrees = data.degrees[curr_links].to(device)
-            if hasattr(data, 'RA') and data.RA is not None:
-                RA = data.RA[indices].to(device)
-            else:
-                RA = None
+            RA = data.RA[indices].to(device) if hasattr(data, 'RA') and data.RA is not None else None
             batch_emb = None 
             if model.node_embedding is not None:
                 batch_emb = model.node_embedding.weight[curr_links].to(device)
             
             logits = model(subgraph_features, node_features, degrees[:, 0], degrees[:, 1], RA, batch_emb)
         else:
-            # Skip for other models
             continue
 
-        preds.append(torch.sigmoid(logits).view(-1).detach())
-        indices_list.append(indices)
+        batch_preds = torch.sigmoid(logits).view(-1).detach()
+        
+        # Zero out non-candidates scores so they won't be picked in Top-K
+        # (Technically we want them to be 0 targets, which they are by default)
+        # We set their 'score' to -1 so topk ignores them
+        batch_preds[~candidate_mask] = -1.0
+        
+        preds.append(batch_preds)
         
     if len(preds) > 0:
         all_preds = torch.cat(preds).to(device)
@@ -309,9 +358,19 @@ def update_pull_targets(model, train_loader, device, k):
         if len(neg_scores) > k:
             topk_vals, topk_idx = torch.topk(neg_scores, k)
             global_topk_idx = neg_indices[topk_idx]
-            pull_targets[global_topk_idx] = topk_vals # Soft target
+            
+            # Additional check: only use valid scores (not -1)
+            # If we requested K but fewer than K candidates exist, topk might include -1s.
+            valid_mask = topk_vals > -0.5
+            if valid_mask.sum() < len(topk_vals):
+                global_topk_idx = global_topk_idx[valid_mask]
+                topk_vals = topk_vals[valid_mask]
+            
+            pull_targets[global_topk_idx] = topk_vals 
         else:
-            pull_targets[neg_indices] = neg_scores
+            # Check valid
+            valid_mask = neg_scores > -0.5
+            pull_targets[neg_indices[valid_mask]] = neg_scores[valid_mask]
 
     return pull_targets
 
@@ -438,6 +497,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_pull', action='store_true', help='whether to use PULL (Positive Unlabeled Learning)')
     parser.add_argument('--pull_k', type=int, default=1000, help='number of pseudo-positives for PULL')
     parser.add_argument('--pull_interval', type=int, default=10, help='epoch interval for updating PULL targets')
+    parser.add_argument('--pull_m', type=int, default=100, help='number of high degree nodes for candidate set filtering')
 
     args = parser.parse_args()
     if (args.max_hash_hops == 1) and (not args.use_zero_one):
